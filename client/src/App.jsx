@@ -1,5 +1,5 @@
 import { useState } from "react";
-import apiClient from "./api";
+import apiClient, { API_ORIGIN } from "./api";
 import "./App.css";
 
 function App() {
@@ -8,26 +8,31 @@ function App() {
   const [videoInfo, setVideoInfo] = useState(null);
   const [downloadLink, setDownloadLink] = useState(null);
 
-  // UI states to handle spinners and error messages
   const [isLoading, setIsLoading] = useState(false);
   const [isConverting, setIsConverting] = useState(false);
   const [error, setError] = useState(null);
+
+  // NEW STATES FOR PROGRESS
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState("");
 
   // --- 2. LOGIC: Fetch Video Info ---
   // Triggered when the user pastes a link and clicks "Check Video"
   const handleCheckVideo = async (e) => {
     e.preventDefault();
-    if (!url) return;
+    const videoUrl = url.trim();
+    if (!videoUrl) return;
 
     setIsLoading(true);
     setError(null);
     setVideoInfo(null);
     setDownloadLink(null);
+    setUrl(videoUrl);
 
     try {
       // Hits our GET /api/info route
       const response = await apiClient.get(
-        `/info?url=${encodeURIComponent(url)}`,
+        `/info?url=${encodeURIComponent(videoUrl)}`,
       );
       setVideoInfo(response.data);
     } catch (err) {
@@ -41,24 +46,52 @@ function App() {
   };
 
   // --- 3. LOGIC: Convert & Download ---
-  // Triggered when the user confirms the thumbnail and clicks "Convert to MP3"
-  const handleConvert = async () => {
+  const handleConvert = () => {
+    const videoUrl = url.trim();
+    if (!videoUrl) {
+      setError("Please paste a valid YouTube URL.");
+      return;
+    }
+
     setIsConverting(true);
     setError(null);
+    setProgress(0);
+    setStatusMessage("Initializing...");
 
-    try {
-      // Hits our POST /api/convert route
-      const response = await apiClient.post("/convert", { url });
+    // Open the live connection to our new streaming endpoint
+    // Open the live connection with explicit credentials allowed
+    const eventSource = new EventSource(
+      `${API_ORIGIN}/api/convert-stream?url=${encodeURIComponent(videoUrl)}`,
+      { withCredentials: true },
+    );
 
-      if (response.data.success) {
-        // We combine our backend host with the relative link provided
-        setDownloadLink(`http://localhost:5001${response.data.downloadLink}`);
+    // Listen for incoming data packets
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.status === "processing") {
+        setStatusMessage(data.message);
+      } else if (data.status === "downloading") {
+        setProgress(Number(data.progress));
+        setStatusMessage(`Downloading... ${data.progress}%`);
+      } else if (data.status === "complete") {
+        setDownloadLink(`${API_ORIGIN}${data.downloadLink}`);
+        setIsConverting(false);
+        setStatusMessage("");
+        eventSource.close(); // Close connection when finished
+      } else if (data.status === "error") {
+        setError(data.message);
+        setIsConverting(false);
+        eventSource.close();
       }
-    } catch {
-      setError("An error occurred during conversion. Please try again.");
-    } finally {
+    };
+
+    // Handle network drops
+    eventSource.onerror = () => {
+      setError("Lost connection to the server. Please try again.");
       setIsConverting(false);
-    }
+      eventSource.close();
+    };
   };
 
   // --- 4. THE UI RENDER ---
@@ -108,6 +141,18 @@ function App() {
               ? "Converting Audio... Please wait."
               : "Convert to MP3"}
           </button>
+          {/* New Progress Bar UI */}
+          {isConverting && (
+            <div className="progress-container">
+              <p className="status-text">{statusMessage}</p>
+              <div className="progress-bar-bg">
+                <div
+                  className="progress-bar-fill"
+                  style={{ width: `${progress}%` }}
+                ></div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

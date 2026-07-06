@@ -4,7 +4,9 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url"; // Required to recreate __dirname
-import youtubedl from "youtube-dl-exec";
+import pkg from "youtube-dl-exec";
+const youtubedl = pkg.default || pkg;
+const ytdlExec = pkg.exec || youtubedl.exec;
 import ffmpeg from "ffmpeg-static";
 
 // 1. Recreate __dirname for ES Modules
@@ -75,29 +77,43 @@ app.post("/api/convert", async (req, res) => {
       .json({ error: "YouTube URL is required in the request body." });
   }
 
-  // Generate a unique filename using a timestamp to prevent overwriting
-  const fileId = `audio_${Date.now()}`;
-  const outputFilename = `${fileId}.mp3`;
-  const finalFilePath = path.join(tempDir, outputFilename);
-
   try {
-    console.log(`Starting conversion for: ${url}`);
+    console.log(`Starting metadata extraction for: ${url}`);
 
+    // 1. Fetch the metadata first to grab the real video title
+    const info = await youtubedl(url, {
+      dumpSingleJson: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+    });
+
+    // 2. Sanitize the title!
+    // This regex removes illegal OS characters: < > : " / \ | ? *
+    const cleanTitle = info.title.replace(/[<>:"/\\|?*]+/g, "").trim();
+
+    // 3. Create the exact filename using the sanitized title
+    const outputFilename = `${cleanTitle}.mp3`;
+    const finalFilePath = path.join(tempDir, outputFilename);
+
+    console.log(`Downloading and converting to: ${outputFilename}`);
+
+    // 4. Run the download engine
     await youtubedl(url, {
       extractAudio: true,
       audioFormat: "mp3",
-      audioQuality: 0, // 0 is the best quality
+      audioQuality: 0,
       output: finalFilePath,
-      ffmpegLocation: ffmpeg, // Points yt-dlp to our local npm ffmpeg binary
+      ffmpegLocation: ffmpeg,
       noCheckCertificates: true,
     });
 
     console.log(`Successfully converted and saved to: ${finalFilePath}`);
 
-    // Return the static link that the frontend will use to download the file
+    // Return the static link. We use encodeURIComponent so spaces in the title
+    // don't break the URL string when sent back to the React frontend.
     res.json({
       success: true,
-      downloadLink: `/api/download/${outputFilename}`,
+      downloadLink: `/api/download/${encodeURIComponent(outputFilename)}`,
     });
   } catch (error) {
     console.error("Conversion failed:", error);
@@ -109,12 +125,12 @@ app.post("/api/convert", async (req, res) => {
 // ROUTE 3: Serve the MP3 File for Download
 // ---------------------------------------------------------
 app.get("/api/download/:filename", (req, res) => {
-  const filename = req.params.filename;
+  // Decode the filename to handle spaces and special characters properly
+  const filename = decodeURIComponent(req.params.filename);
   const filePath = path.join(tempDir, filename);
 
-  // Security check: ensure the file exists before attempting to send it
   if (fs.existsSync(filePath)) {
-    // res.download forces the browser to download the file rather than trying to play it
+    // res.download forces the browser to save the file with the exact title
     res.download(filePath, filename, (err) => {
       if (err) {
         console.error("Error sending file to client:", err);
@@ -122,6 +138,95 @@ app.get("/api/download/:filename", (req, res) => {
     });
   } else {
     res.status(404).json({ error: "File not found or has expired." });
+  }
+});
+
+// ---------------------------------------------------------
+// ROUTE 4: SSE Progress Stream
+// ---------------------------------------------------------
+app.get("/api/convert-stream", async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: "YouTube URL is required." });
+  }
+
+  // 1. Establish SSE headers to keep the connection open
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  res.setHeader("Access-Control-Allow-Origin", "http://localhost:5173");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  try {
+    // Send initial status to the frontend
+    res.write(
+      `data: ${JSON.stringify({ status: "processing", message: "Fetching metadata..." })}\n\n`,
+    );
+
+    const info = await youtubedl(url, {
+      dumpSingleJson: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+    });
+    const cleanTitle = info.title.replace(/[<>:"/\\|?*]+/g, "").trim();
+    const outputFilename = `${cleanTitle}.mp3`;
+    const finalFilePath = path.join(tempDir, outputFilename);
+
+    res.write(
+      `data: ${JSON.stringify({ status: "processing", message: "Downloading video stream..." })}\n\n`,
+    );
+
+    // 2. Start the child process using ytdlExec() so we can read live terminal output
+    const subprocess = ytdlExec(url, {
+      extractAudio: true,
+      audioFormat: "mp3",
+      audioQuality: 0,
+      output: finalFilePath,
+      ffmpegLocation: ffmpeg,
+      noCheckCertificates: true,
+    });
+
+    // 3. Listen to the live output (stdout)
+    subprocess.stdout.on("data", (data) => {
+      const text = data.toString();
+
+      // Use regex to scrape the percentage (e.g., "[download]  45.5%")
+      const progressMatch = text.match(/\[download\]\s+([\d\.]+)%/);
+      if (progressMatch) {
+        res.write(
+          `data: ${JSON.stringify({ status: "downloading", progress: progressMatch[1] })}\n\n`,
+        );
+      }
+
+      // Detect when yt-dlp finishes downloading and hands off to FFmpeg for conversion
+      if (text.includes("[ExtractAudio]")) {
+        res.write(
+          `data: ${JSON.stringify({ status: "processing", message: "Converting to MP3 (this may take a minute)..." })}\n\n`,
+        );
+      }
+    });
+
+    // 4. Handle completion and close the stream
+    subprocess.on("close", (code) => {
+      if (code === 0) {
+        res.write(
+          `data: ${JSON.stringify({ status: "complete", downloadLink: `/api/download/${encodeURIComponent(outputFilename)}` })}\n\n`,
+        );
+      } else {
+        res.write(
+          `data: ${JSON.stringify({ status: "error", message: "Conversion process failed." })}\n\n`,
+        );
+      }
+      res.end(); // Safely closes the SSE connection
+    });
+  } catch (error) {
+    console.error("Stream error:", error);
+    res.write(
+      `data: ${JSON.stringify({ status: "error", message: "An unexpected error occurred." })}\n\n`,
+    );
+    res.end();
   }
 });
 

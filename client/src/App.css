@@ -166,3 +166,30 @@ button:disabled {
     opacity: 1;
   }
 }
+
+/* Progress Bar Styles */
+.progress-container {
+  margin-top: 20px;
+  text-align: left;
+}
+
+.status-text {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.progress-bar-bg {
+  width: 100%;
+  background-color: #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+  height: 12px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background-color: #10b981;
+  transition: width 0.3s ease; /* Smooth animation between percentages */
+}
