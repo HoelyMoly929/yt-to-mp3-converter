@@ -36,5 +36,5 @@ Before cloning this repository, ensure you have the following installed on your 
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/HoelyMoly929/yt-to-mp3-converter.git](https://github.com/HoelyMoly929/yt-to-mp3-converter.git
+git clone https://github.com/HoelyMoly929/yt-to-mp3-converter.git
 cd yt-to-mp3-converter
